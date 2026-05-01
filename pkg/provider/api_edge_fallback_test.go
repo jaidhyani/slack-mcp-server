@@ -12,7 +12,6 @@ func TestEdgeFallbackFlag(t *testing.T) {
 	t.Run("edgeFailed starts false", func(t *testing.T) {
 		c := &MCPSlackClient{
 			isEnterprise: true,
-			isOAuth:      false,
 		}
 		assert.False(t, c.edgeFailed, "edgeFailed should start as false")
 	})
@@ -20,7 +19,6 @@ func TestEdgeFallbackFlag(t *testing.T) {
 	t.Run("edgeFailed flag is sticky", func(t *testing.T) {
 		c := &MCPSlackClient{
 			isEnterprise: true,
-			isOAuth:      false,
 			edgeFailed:   true,
 		}
 		assert.True(t, c.edgeFailed, "edgeFailed should remain true once set")
@@ -56,11 +54,11 @@ func TestGetConversationsContextRouting(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := &MCPSlackClient{
 				isEnterprise: tt.isEnterprise,
-				isOAuth:      tt.isOAuth,
 				edgeFailed:   tt.edgeFailed,
 			}
+			c.isOAuth.Store(tt.isOAuth)
 
-			wouldTryEdge := c.isEnterprise && !c.isOAuth && !c.edgeFailed
+			wouldTryEdge := c.isEnterprise && !c.isOAuth.Load() && !c.edgeFailed
 			assert.Equal(t, tt.expectEdge, wouldTryEdge)
 		})
 	}
@@ -72,16 +70,16 @@ func TestGetConversationsContextRouting(t *testing.T) {
 func TestEdgeFailedPreventsRetry(t *testing.T) {
 	c := &MCPSlackClient{
 		isEnterprise: true,
-		isOAuth:      false,
 		edgeFailed:   false,
 	}
+	c.isOAuth.Store(false)
 
 	// Simulate edge failure
 	c.edgeFailed = true
 
 	// Verify 10 subsequent "pagination" calls would all skip edge
 	for i := 0; i < 10; i++ {
-		wouldTryEdge := c.isEnterprise && !c.isOAuth && !c.edgeFailed
+		wouldTryEdge := c.isEnterprise && !c.isOAuth.Load() && !c.edgeFailed
 		assert.False(t, wouldTryEdge,
 			"call %d: should not try edge after it failed", i+1)
 	}

@@ -233,12 +233,26 @@ type MCPSlackClient struct {
 	authResponse *slack.AuthTestResponse
 	authProvider auth.Provider
 
-	httpClient    *http.Client // captured once; reused across rebuilds
-	isEnterprise  bool
-	isOAuth       bool
-	isBotToken    bool
-	edgeFailed    bool // set when edge API fails; subsequent calls skip straight to standard API
-	teamEndpoint  string
+	httpClient   *http.Client // captured once; reused across rebuilds
+	isEnterprise bool
+	// isOAuth and isBotToken are atomic so Rebuild() can recompute them
+	// from the freshly rotated token without racing concurrent readers.
+	// The rotated-token prefix has been observed to stay stable across
+	// refreshes in practice (Slack keeps `xoxe.xoxp-`), but recomputing
+	// here removes the assumption.
+	isOAuth      atomic.Bool
+	isBotToken   atomic.Bool
+	edgeFailed   bool // set when edge API fails; subsequent calls skip straight to standard API
+	teamEndpoint string
+}
+
+// classifyToken returns (isOAuth, isBotToken) for a Slack token. Recognizes
+// both unrotated (xoxp-/xoxb-) and rotated (xoxe.xoxp-/xoxe.xoxb-) prefixes.
+func classifyToken(token string) (oauth, bot bool) {
+	oauth = strings.HasPrefix(token, "xoxp-") || strings.HasPrefix(token, "xoxb-") ||
+		strings.HasPrefix(token, "xoxe.xoxp-") || strings.HasPrefix(token, "xoxe.xoxb-")
+	bot = strings.HasPrefix(token, "xoxb-") || strings.HasPrefix(token, "xoxe.xoxb-")
+	return
 }
 
 // sc returns the current slack.Client pointer. Lock-free.
@@ -248,10 +262,12 @@ func (c *MCPSlackClient) sc() *slack.Client { return c.slackClient.Load() }
 func (c *MCPSlackClient) ec() *edge.Client { return c.edgeClient.Load() }
 
 // Rebuild reconstructs the underlying slack and edge clients using the
-// current token from authProvider. Safe to call from a rotator-subscriber
-// goroutine; readers see either the old or new client until the swap
-// completes, never a torn state. Returns an error if the new edge client
-// cannot be constructed.
+// current token from authProvider, and recomputes the token-type flags so
+// they reflect the post-rotation token (e.g., a switch from xoxp- to
+// xoxe.xoxp- after Token Rotation is enabled mid-life). Safe to call from
+// a rotator-subscriber goroutine; readers see either the old or new
+// client/flags until the swap completes, never a torn state. Returns an
+// error if the new edge client cannot be constructed.
 func (c *MCPSlackClient) Rebuild() error {
 	token := c.authProvider.SlackToken()
 	if token == "" {
@@ -270,6 +286,9 @@ func (c *MCPSlackClient) Rebuild() error {
 		return err
 	}
 
+	oauth, bot := classifyToken(token)
+	c.isOAuth.Store(oauth)
+	c.isBotToken.Store(bot)
 	c.slackClient.Store(newSlack)
 	c.edgeClient.Store(newEdge)
 	return nil
@@ -338,24 +357,17 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 	isEnterprise := authResp.EnterpriseID != ""
 	token := authProvider.SlackToken()
 
-	// Token type detection
-	// isOAuth: Official OAuth tokens (xoxp or xoxb) — uses Standard API.
-	// Includes the xoxe.xoxp-/xoxe.xoxb- prefix used by Slack's rotated
-	// (token-rotation-enabled) variants of the same token classes.
-	// isBotToken: Bot token — determines feature availability (e.g., search).
-	isOAuth := strings.HasPrefix(token, "xoxp-") || strings.HasPrefix(token, "xoxb-") ||
-		strings.HasPrefix(token, "xoxe.xoxp-") || strings.HasPrefix(token, "xoxe.xoxb-")
-	isBotToken := strings.HasPrefix(token, "xoxb-") || strings.HasPrefix(token, "xoxe.xoxb-")
+	oauth, bot := classifyToken(token)
 
 	c := &MCPSlackClient{
 		authResponse: authResponse,
 		authProvider: authProvider,
 		httpClient:   httpClient,
 		isEnterprise: isEnterprise,
-		isOAuth:      isOAuth,
-		isBotToken:   isBotToken,
 		teamEndpoint: authResp.URL,
 	}
+	c.isOAuth.Store(oauth)
+	c.isBotToken.Store(bot)
 	c.slackClient.Store(slackClient)
 	c.edgeClient.Store(edgeClient)
 	return c, nil
@@ -403,7 +415,7 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 	// and if `xoxc`/`xoxd` defined we fallback to edge client.
 	// In non Enterprise Grid setups we always use `conversations.list` api as it accepts both token types wtf.
 	if c.isEnterprise {
-		if c.isOAuth {
+		if c.isOAuth.Load() {
 			return c.sc().GetConversationsContext(ctx, params)
 		}
 
@@ -583,11 +595,11 @@ func (c *MCPSlackClient) AuthResponse() *slack.AuthTestResponse {
 }
 
 func (c *MCPSlackClient) IsBotToken() bool {
-	return c.isBotToken
+	return c.isBotToken.Load()
 }
 
 func (c *MCPSlackClient) IsOAuth() bool {
-	return c.isOAuth
+	return c.isOAuth.Load()
 }
 
 func (c *MCPSlackClient) Raw() struct {
