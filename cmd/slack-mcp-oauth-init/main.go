@@ -42,6 +42,7 @@ func main() {
 		clientID     string
 		clientSecret string
 		redirectURI  string
+		listenAddr   string
 		scopes       string
 		userScopes   string
 		outPath      string
@@ -49,7 +50,8 @@ func main() {
 	)
 	flag.StringVar(&clientID, "client-id", "", "Slack app client ID (required)")
 	flag.StringVar(&clientSecret, "client-secret", "", "Slack app client secret (required)")
-	flag.StringVar(&redirectURI, "redirect-uri", "http://localhost:3119/callback", "OAuth redirect URI (must match the Slack app config)")
+	flag.StringVar(&redirectURI, "redirect-uri", "http://localhost:3119/callback", "OAuth redirect URI (must match the Slack app config exactly)")
+	flag.StringVar(&listenAddr, "listen", "", "local host:port to bind the callback listener on; defaults to redirect-uri's host:port for localhost redirects, otherwise localhost:3119 (use with a reverse proxy when redirect-uri is public)")
 	flag.StringVar(&scopes, "scopes", "", "comma-separated bot scopes (passed to scope=)")
 	flag.StringVar(&userScopes, "user-scopes", "channels:history,channels:read,groups:history,groups:read,im:history,im:read,im:write,mpim:history,mpim:read,mpim:write,users:read,users:read.email,chat:write,search:read,reactions:write,usergroups:read,usergroups:write", "comma-separated user scopes (passed to user_scope=)")
 	flag.StringVar(&outPath, "out", "", "credential file output path (required)")
@@ -66,8 +68,13 @@ func main() {
 	if err != nil {
 		exitf("invalid redirect-uri: %v", err)
 	}
-	if parsedRedirect.Hostname() != "localhost" && parsedRedirect.Hostname() != "127.0.0.1" {
-		exitf("redirect-uri must point to localhost; got %q", parsedRedirect.Hostname())
+	isLocal := parsedRedirect.Hostname() == "localhost" || parsedRedirect.Hostname() == "127.0.0.1"
+	if listenAddr == "" {
+		if isLocal {
+			listenAddr = parsedRedirect.Host
+		} else {
+			listenAddr = "localhost:3119"
+		}
 	}
 
 	// State token for CSRF protection.
@@ -87,8 +94,8 @@ func main() {
 	}
 	authU.RawQuery = q.Encode()
 
-	// Bind the local listener.
-	listenAddr := parsedRedirect.Host
+	// Bind the local listener at listenAddr (which may differ from
+	// redirectURI when a reverse proxy fronts the public HTTPS endpoint).
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		exitf("listen %s: %v", listenAddr, err)
@@ -134,7 +141,7 @@ func main() {
 	fmt.Fprintln(os.Stderr, "==>")
 	fmt.Fprintln(os.Stderr, "    "+authU.String())
 	fmt.Fprintln(os.Stderr, "==>")
-	fmt.Fprintf(os.Stderr, "==> Waiting on callback at %s (timeout: %s)\n", redirectURI, timeout)
+	fmt.Fprintf(os.Stderr, "==> Listening on %s; expecting callback at %s (timeout: %s)\n", listenAddr, redirectURI, timeout)
 
 	var code string
 	select {

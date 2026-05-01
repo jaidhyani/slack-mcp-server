@@ -50,6 +50,10 @@ func (p *Provider) Test(_ context.Context) (*slack.AuthTestResponse, error) {
 	}, nil
 }
 
+// HTTPClient returns a default *http.Client. The slack-mcp-server's edge
+// constructor calls this and then immediately overrides the result via
+// OptionHTTPClient, so what we return here is effectively a placeholder —
+// but it must not error.
 func (p *Provider) HTTPClient() (*http.Client, error) {
-	return nil, errNotSupported
+	return &http.Client{}, nil
 }

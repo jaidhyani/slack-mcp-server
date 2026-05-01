@@ -339,10 +339,13 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 	token := authProvider.SlackToken()
 
 	// Token type detection
-	// isOAuth: Official OAuth tokens (xoxp or xoxb) - uses Standard API
-	// isBotToken: Bot token - determines feature availability (e.g., search)
-	isOAuth := strings.HasPrefix(token, "xoxp-") || strings.HasPrefix(token, "xoxb-")
-	isBotToken := strings.HasPrefix(token, "xoxb-")
+	// isOAuth: Official OAuth tokens (xoxp or xoxb) — uses Standard API.
+	// Includes the xoxe.xoxp-/xoxe.xoxb- prefix used by Slack's rotated
+	// (token-rotation-enabled) variants of the same token classes.
+	// isBotToken: Bot token — determines feature availability (e.g., search).
+	isOAuth := strings.HasPrefix(token, "xoxp-") || strings.HasPrefix(token, "xoxb-") ||
+		strings.HasPrefix(token, "xoxe.xoxp-") || strings.HasPrefix(token, "xoxe.xoxb-")
+	isBotToken := strings.HasPrefix(token, "xoxb-") || strings.HasPrefix(token, "xoxe.xoxb-")
 
 	c := &MCPSlackClient{
 		authResponse: authResponse,
