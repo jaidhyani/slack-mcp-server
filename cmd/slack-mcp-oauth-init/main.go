@@ -51,7 +51,7 @@ func main() {
 	flag.StringVar(&clientSecret, "client-secret", "", "Slack app client secret (required)")
 	flag.StringVar(&redirectURI, "redirect-uri", "http://localhost:3119/callback", "OAuth redirect URI (must match the Slack app config)")
 	flag.StringVar(&scopes, "scopes", "", "comma-separated bot scopes (passed to scope=)")
-	flag.StringVar(&userScopes, "user-scopes", "search:read,channels:history,im:history,mpim:history,groups:history,users:read,users:read.email", "comma-separated user scopes (passed to user_scope=)")
+	flag.StringVar(&userScopes, "user-scopes", "channels:history,channels:read,groups:history,groups:read,im:history,im:read,im:write,mpim:history,mpim:read,mpim:write,users:read,users:read.email,chat:write,search:read,reactions:write,usergroups:read,usergroups:write", "comma-separated user scopes (passed to user_scope=)")
 	flag.StringVar(&outPath, "out", "", "credential file output path (required)")
 	flag.DurationVar(&timeout, "timeout", 5*time.Minute, "how long to wait for the OAuth callback")
 	flag.Parse()

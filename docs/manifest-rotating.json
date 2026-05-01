@@ -1,0 +1,38 @@
+{
+  "display_information": {
+    "name": "Slack MCP (rotating)",
+    "description": "Slack MCP backend with rotating OAuth tokens for Claude Code. Read + write user-scoped access.",
+    "background_color": "#2c2d30"
+  },
+  "oauth_config": {
+    "redirect_urls": [
+      "http://localhost:3119/callback"
+    ],
+    "scopes": {
+      "user": [
+        "channels:history",
+        "channels:read",
+        "groups:history",
+        "groups:read",
+        "im:history",
+        "im:read",
+        "im:write",
+        "mpim:history",
+        "mpim:read",
+        "mpim:write",
+        "users:read",
+        "users:read.email",
+        "chat:write",
+        "search:read",
+        "reactions:write",
+        "usergroups:read",
+        "usergroups:write"
+      ]
+    }
+  },
+  "settings": {
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": false,
+    "token_rotation_enabled": true
+  }
+}
