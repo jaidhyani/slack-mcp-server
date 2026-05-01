@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -222,17 +223,56 @@ type SlackAPI interface {
 }
 
 type MCPSlackClient struct {
-	slackClient *slack.Client
-	edgeClient  *edge.Client
+	// slackClient and edgeClient are atomic.Pointers to support live token
+	// rotation: when the rotator emits a new access token, Rebuild()
+	// reconstructs both clients with fresh slack.New(...) / edge.NewWithInfo(...)
+	// and atomically swaps the pointers. Reads (via sc()/ec()) are lock-free.
+	slackClient atomic.Pointer[slack.Client]
+	edgeClient  atomic.Pointer[edge.Client]
 
 	authResponse *slack.AuthTestResponse
 	authProvider auth.Provider
 
+	httpClient    *http.Client // captured once; reused across rebuilds
 	isEnterprise  bool
 	isOAuth       bool
 	isBotToken    bool
 	edgeFailed    bool // set when edge API fails; subsequent calls skip straight to standard API
 	teamEndpoint  string
+}
+
+// sc returns the current slack.Client pointer. Lock-free.
+func (c *MCPSlackClient) sc() *slack.Client { return c.slackClient.Load() }
+
+// ec returns the current edge.Client pointer. Lock-free.
+func (c *MCPSlackClient) ec() *edge.Client { return c.edgeClient.Load() }
+
+// Rebuild reconstructs the underlying slack and edge clients using the
+// current token from authProvider. Safe to call from a rotator-subscriber
+// goroutine; readers see either the old or new client until the swap
+// completes, never a torn state. Returns an error if the new edge client
+// cannot be constructed.
+func (c *MCPSlackClient) Rebuild() error {
+	token := c.authProvider.SlackToken()
+	if token == "" {
+		return errors.New("rebuild: empty token")
+	}
+
+	newSlack := slack.New(token,
+		slack.OptionHTTPClient(c.httpClient),
+		slack.OptionAPIURL(c.teamEndpoint+"api/"),
+	)
+
+	newEdge, err := edge.NewWithInfo(c.authResponse, c.authProvider,
+		edge.OptionHTTPClient(c.httpClient),
+	)
+	if err != nil {
+		return err
+	}
+
+	c.slackClient.Store(newSlack)
+	c.edgeClient.Store(newEdge)
+	return nil
 }
 
 type ApiProvider struct {
@@ -304,16 +344,18 @@ func NewMCPSlackClient(authProvider auth.Provider, logger *zap.Logger) (*MCPSlac
 	isOAuth := strings.HasPrefix(token, "xoxp-") || strings.HasPrefix(token, "xoxb-")
 	isBotToken := strings.HasPrefix(token, "xoxb-")
 
-	return &MCPSlackClient{
-		slackClient:  slackClient,
-		edgeClient:   edgeClient,
+	c := &MCPSlackClient{
 		authResponse: authResponse,
 		authProvider: authProvider,
+		httpClient:   httpClient,
 		isEnterprise: isEnterprise,
 		isOAuth:      isOAuth,
 		isBotToken:   isBotToken,
 		teamEndpoint: authResp.URL,
-	}, nil
+	}
+	c.slackClient.Store(slackClient)
+	c.edgeClient.Store(edgeClient)
+	return c, nil
 }
 
 func (c *MCPSlackClient) AuthTest() (*slack.AuthTestResponse, error) {
@@ -333,23 +375,23 @@ func (c *MCPSlackClient) AuthTest() (*slack.AuthTestResponse, error) {
 		return c.authResponse, nil
 	}
 
-	return c.slackClient.AuthTest()
+	return c.sc().AuthTest()
 }
 
 func (c *MCPSlackClient) AuthTestContext(ctx context.Context) (*slack.AuthTestResponse, error) {
-	return c.slackClient.AuthTestContext(ctx)
+	return c.sc().AuthTestContext(ctx)
 }
 
 func (c *MCPSlackClient) GetUsersContext(ctx context.Context, options ...slack.GetUsersOption) ([]slack.User, error) {
-	return c.slackClient.GetUsersContext(ctx, options...)
+	return c.sc().GetUsersContext(ctx, options...)
 }
 
 func (c *MCPSlackClient) GetUsersInfo(users ...string) (*[]slack.User, error) {
-	return c.slackClient.GetUsersInfo(users...)
+	return c.sc().GetUsersInfo(users...)
 }
 
 func (c *MCPSlackClient) MarkConversationContext(ctx context.Context, channel, ts string) error {
-	return c.slackClient.MarkConversationContext(ctx, channel, ts)
+	return c.sc().MarkConversationContext(ctx, channel, ts)
 }
 
 func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *slack.GetConversationsParameters) ([]slack.Channel, string, error) {
@@ -359,7 +401,7 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 	// In non Enterprise Grid setups we always use `conversations.list` api as it accepts both token types wtf.
 	if c.isEnterprise {
 		if c.isOAuth {
-			return c.slackClient.GetConversationsContext(ctx, params)
+			return c.sc().GetConversationsContext(ctx, params)
 		}
 
 		// Enterprise + non-OAuth: try edge API first (for DMs, MPIMs, etc.),
@@ -372,10 +414,10 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 		// API here and return a merged, deduplicated result set with an
 		// empty cursor so the caller doesn't need to re-paginate.
 		if !c.edgeFailed {
-			edgeChannels, _, edgeErr := c.edgeClient.GetConversationsContext(ctx, nil)
+			edgeChannels, _, edgeErr := c.ec().GetConversationsContext(ctx, nil)
 			if edgeErr != nil {
 				c.edgeFailed = true
-				return c.slackClient.GetConversationsContext(ctx, params)
+				return c.sc().GetConversationsContext(ctx, params)
 			}
 
 			// Collect edge results into a map for deduplication.
@@ -427,7 +469,7 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 				stdParams.Types = params.Types
 			}
 			for {
-				stdChannels, nextCur, stdErr := c.slackClient.GetConversationsContext(ctx, stdParams)
+				stdChannels, nextCur, stdErr := c.sc().GetConversationsContext(ctx, stdParams)
 				if stdErr != nil {
 					break // standard API failed; keep what edge gave us
 				}
@@ -447,86 +489,86 @@ func (c *MCPSlackClient) GetConversationsContext(ctx context.Context, params *sl
 		}
 
 		// Edge API previously failed — use standard API directly.
-		return c.slackClient.GetConversationsContext(ctx, params)
+		return c.sc().GetConversationsContext(ctx, params)
 	}
 
-	return c.slackClient.GetConversationsContext(ctx, params)
+	return c.sc().GetConversationsContext(ctx, params)
 }
 
 func (c *MCPSlackClient) GetConversationsForUserContext(ctx context.Context, params *slack.GetConversationsForUserParameters) ([]slack.Channel, string, error) {
-	return c.slackClient.GetConversationsForUserContext(ctx, params)
+	return c.sc().GetConversationsForUserContext(ctx, params)
 }
 
 func (c *MCPSlackClient) GetConversationHistoryContext(ctx context.Context, params *slack.GetConversationHistoryParameters) (*slack.GetConversationHistoryResponse, error) {
-	return c.slackClient.GetConversationHistoryContext(ctx, params)
+	return c.sc().GetConversationHistoryContext(ctx, params)
 }
 
 func (c *MCPSlackClient) GetConversationRepliesContext(ctx context.Context, params *slack.GetConversationRepliesParameters) (msgs []slack.Message, hasMore bool, nextCursor string, err error) {
-	return c.slackClient.GetConversationRepliesContext(ctx, params)
+	return c.sc().GetConversationRepliesContext(ctx, params)
 }
 
 func (c *MCPSlackClient) SearchContext(ctx context.Context, query string, params slack.SearchParameters) (*slack.SearchMessages, *slack.SearchFiles, error) {
-	return c.slackClient.SearchContext(ctx, query, params)
+	return c.sc().SearchContext(ctx, query, params)
 }
 
 func (c *MCPSlackClient) PostMessageContext(ctx context.Context, channelID string, options ...slack.MsgOption) (string, string, error) {
-	return c.slackClient.PostMessageContext(ctx, channelID, options...)
+	return c.sc().PostMessageContext(ctx, channelID, options...)
 }
 
 func (c *MCPSlackClient) AddReactionContext(ctx context.Context, name string, item slack.ItemRef) error {
-	return c.slackClient.AddReactionContext(ctx, name, item)
+	return c.sc().AddReactionContext(ctx, name, item)
 }
 
 func (c *MCPSlackClient) RemoveReactionContext(ctx context.Context, name string, item slack.ItemRef) error {
-	return c.slackClient.RemoveReactionContext(ctx, name, item)
+	return c.sc().RemoveReactionContext(ctx, name, item)
 }
 
 func (c *MCPSlackClient) GetFileInfoContext(ctx context.Context, fileID string, count, page int) (*slack.File, []slack.Comment, *slack.Paging, error) {
-	return c.slackClient.GetFileInfoContext(ctx, fileID, count, page)
+	return c.sc().GetFileInfoContext(ctx, fileID, count, page)
 }
 
 func (c *MCPSlackClient) GetFileContext(ctx context.Context, downloadURL string, writer io.Writer) error {
-	return c.slackClient.GetFileContext(ctx, downloadURL, writer)
+	return c.sc().GetFileContext(ctx, downloadURL, writer)
 }
 
 func (c *MCPSlackClient) GetConversationInfoContext(ctx context.Context, input *slack.GetConversationInfoInput) (*slack.Channel, error) {
-	return c.slackClient.GetConversationInfoContext(ctx, input)
+	return c.sc().GetConversationInfoContext(ctx, input)
 }
 
 func (c *MCPSlackClient) ClientUserBoot(ctx context.Context) (*edge.ClientUserBootResponse, error) {
-	return c.edgeClient.ClientUserBoot(ctx)
+	return c.ec().ClientUserBoot(ctx)
 }
 
 func (c *MCPSlackClient) UsersSearch(ctx context.Context, query string, count int) ([]slack.User, error) {
-	return c.edgeClient.UsersSearch(ctx, query, count)
+	return c.ec().UsersSearch(ctx, query, count)
 }
 
 func (c *MCPSlackClient) ClientCounts(ctx context.Context) (edge.ClientCountsResponse, error) {
-	return c.edgeClient.ClientCounts(ctx)
+	return c.ec().ClientCounts(ctx)
 }
 
 func (c *MCPSlackClient) GetMutedChannels(ctx context.Context) (map[string]bool, error) {
-	return c.edgeClient.GetMutedChannels(ctx)
+	return c.ec().GetMutedChannels(ctx)
 }
 
 func (c *MCPSlackClient) GetUserGroupsContext(ctx context.Context, options ...slack.GetUserGroupsOption) ([]slack.UserGroup, error) {
-	return c.slackClient.GetUserGroupsContext(ctx, options...)
+	return c.sc().GetUserGroupsContext(ctx, options...)
 }
 
 func (c *MCPSlackClient) GetUserGroupMembersContext(ctx context.Context, userGroup string, options ...slack.GetUserGroupMembersOption) ([]string, error) {
-	return c.slackClient.GetUserGroupMembersContext(ctx, userGroup, options...)
+	return c.sc().GetUserGroupMembersContext(ctx, userGroup, options...)
 }
 
 func (c *MCPSlackClient) CreateUserGroupContext(ctx context.Context, userGroup slack.UserGroup, options ...slack.CreateUserGroupOption) (slack.UserGroup, error) {
-	return c.slackClient.CreateUserGroupContext(ctx, userGroup, options...)
+	return c.sc().CreateUserGroupContext(ctx, userGroup, options...)
 }
 
 func (c *MCPSlackClient) UpdateUserGroupContext(ctx context.Context, userGroupID string, options ...slack.UpdateUserGroupsOption) (slack.UserGroup, error) {
-	return c.slackClient.UpdateUserGroupContext(ctx, userGroupID, options...)
+	return c.sc().UpdateUserGroupContext(ctx, userGroupID, options...)
 }
 
 func (c *MCPSlackClient) UpdateUserGroupMembersContext(ctx context.Context, userGroup string, members string, options ...slack.UpdateUserGroupMembersOption) (slack.UserGroup, error) {
-	return c.slackClient.UpdateUserGroupMembersContext(ctx, userGroup, members, options...)
+	return c.sc().UpdateUserGroupMembersContext(ctx, userGroup, members, options...)
 }
 
 func (c *MCPSlackClient) IsEnterprise() bool {
@@ -553,8 +595,8 @@ func (c *MCPSlackClient) Raw() struct {
 		Slack *slack.Client
 		Edge  *edge.Client
 	}{
-		Slack: c.slackClient,
-		Edge:  c.edgeClient,
+		Slack: c.sc(),
+		Edge:  c.ec(),
 	}
 }
 
@@ -565,10 +607,23 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	)
 
 	// Read all environment variables
+	oauthClientID := os.Getenv("SLACK_MCP_OAUTH_CLIENT_ID")
+	oauthClientSecret := os.Getenv("SLACK_MCP_OAUTH_CLIENT_SECRET")
+	oauthCredFile := os.Getenv("SLACK_MCP_OAUTH_CRED_FILE")
 	xoxpToken := os.Getenv("SLACK_MCP_XOXP_TOKEN")
 	xoxbToken := os.Getenv("SLACK_MCP_XOXB_TOKEN")
 	xoxcToken := os.Getenv("SLACK_MCP_XOXC_TOKEN")
 	xoxdToken := os.Getenv("SLACK_MCP_XOXD_TOKEN")
+
+	// Priority 0 (highest): rotating OAuth. Takes precedence over static
+	// xoxp/xoxb/xoxc when all three OAuth env vars are set.
+	if oauthClientID != "" && oauthClientSecret != "" && oauthCredFile != "" {
+		logger.Info("Using rotating OAuth authentication",
+			zap.String("context", "console"),
+			zap.String("cred_file", oauthCredFile),
+		)
+		return newWithRotatingOAuth(transport, oauthClientID, oauthClientSecret, oauthCredFile, logger)
+	}
 
 	// Warn if both user and bot tokens are set
 	if xoxpToken != "" && xoxbToken != "" {
@@ -618,7 +673,7 @@ func New(transport string, logger *zap.Logger) *ApiProvider {
 	return newWithXOXC(transport, authProvider, logger)
 }
 
-func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
+func newWithXOXP(transport string, authProvider auth.Provider, logger *zap.Logger) *ApiProvider {
 	var (
 		client *MCPSlackClient
 		err    error
@@ -672,13 +727,13 @@ func newWithXOXP(transport string, authProvider auth.ValueAuth, logger *zap.Logg
 	return ap
 }
 
-func newWithXOXB(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
+func newWithXOXB(transport string, authProvider auth.Provider, logger *zap.Logger) *ApiProvider {
 	// Bot tokens do not support demo mode, but otherwise share the same
 	// initialization logic as user OAuth tokens.
 	return newWithXOXP(transport, authProvider, logger)
 }
 
-func newWithXOXC(transport string, authProvider auth.ValueAuth, logger *zap.Logger) *ApiProvider {
+func newWithXOXC(transport string, authProvider auth.Provider, logger *zap.Logger) *ApiProvider {
 	var (
 		client *MCPSlackClient
 		err    error
