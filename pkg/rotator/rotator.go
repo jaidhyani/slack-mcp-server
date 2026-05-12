@@ -248,6 +248,27 @@ func (r *Rotator) Start(ctx context.Context) {
 	go r.loop(ctx)
 }
 
+// RefreshIfDue synchronously refreshes the token if it is within RefreshLead
+// of expiry. Use this before any auth-dependent operation (e.g. validating
+// the token at startup) so callers do not race the background loop. Returns
+// nil if no refresh was needed or if the refresh succeeded, ErrInvalidGrant
+// if the refresh token was rejected (terminal — re-bootstrap required), or
+// another error for transient failures.
+func (r *Rotator) RefreshIfDue(ctx context.Context) error {
+	if !r.shouldRefresh(time.Now()) {
+		return nil
+	}
+	return r.tryRefresh(ctx)
+}
+
+// RefreshNow forces a synchronous refresh regardless of RefreshLead. Use this
+// from out-of-process keepalive jobs (cron) to keep the refresh chain alive
+// when the server may be idle for long stretches between user-driven starts.
+// Returns the same error classes as RefreshIfDue.
+func (r *Rotator) RefreshNow(ctx context.Context) error {
+	return r.tryRefresh(ctx)
+}
+
 // Stop terminates the background loop and waits for it to exit. Safe to call
 // multiple times.
 func (r *Rotator) Stop() {

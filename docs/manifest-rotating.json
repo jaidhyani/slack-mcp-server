@@ -6,7 +6,8 @@
   },
   "oauth_config": {
     "redirect_urls": [
-      "http://localhost:3119/callback"
+      "http://localhost:3119/callback",
+      "https://YOUR-HOST.example.com/slack-oauth/callback"
     ],
     "scopes": {
       "user": [

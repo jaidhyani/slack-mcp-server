@@ -344,6 +344,97 @@ func TestRefresh_TransientErrorRetries(t *testing.T) {
 	}
 }
 
+func TestRefreshIfDue_RefreshesSynchronouslyWhenExpired(t *testing.T) {
+	dir := t.TempDir()
+	// expires in the past → should refresh synchronously
+	path := writeInitialCreds(t, dir, time.Now().Add(-1*time.Hour))
+
+	fake := &fakeOAuth{wantClientID: "cid", wantClientSecret: "csec"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	r, err := New(Config{
+		ClientID:     "cid",
+		ClientSecret: "csec",
+		FilePath:     path,
+		Endpoint:     srv.URL,
+		RefreshLead:  10 * time.Minute,
+		TickInterval: 1 * time.Hour, // ticker should never fire during test
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Do NOT call Start — RefreshIfDue must work synchronously without the
+	// background loop, since the whole point is to beat the goroutine.
+	if err := r.RefreshIfDue(context.Background()); err != nil {
+		t.Fatalf("RefreshIfDue: %v", err)
+	}
+	if fake.calls.Load() != 1 {
+		t.Errorf("expected 1 refresh call, got %d", fake.calls.Load())
+	}
+	if r.Snapshot().AccessToken == "xoxe.xoxp-initial" {
+		t.Error("RefreshIfDue did not rotate the in-memory access token")
+	}
+}
+
+func TestRefreshIfDue_NoOpWhenNotDue(t *testing.T) {
+	dir := t.TempDir()
+	path := writeInitialCreds(t, dir, time.Now().Add(24*time.Hour))
+
+	fake := &fakeOAuth{wantClientID: "cid", wantClientSecret: "csec"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	r, err := New(Config{
+		ClientID:     "cid",
+		ClientSecret: "csec",
+		FilePath:     path,
+		Endpoint:     srv.URL,
+		RefreshLead:  1 * time.Minute,
+		TickInterval: 1 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := r.RefreshIfDue(context.Background()); err != nil {
+		t.Fatalf("RefreshIfDue: %v", err)
+	}
+	if fake.calls.Load() != 0 {
+		t.Errorf("expected 0 refresh calls (not due), got %d", fake.calls.Load())
+	}
+}
+
+func TestRefreshNow_AlwaysRefreshes(t *testing.T) {
+	dir := t.TempDir()
+	// not due → RefreshIfDue would skip, but RefreshNow must call anyway
+	path := writeInitialCreds(t, dir, time.Now().Add(24*time.Hour))
+
+	fake := &fakeOAuth{wantClientID: "cid", wantClientSecret: "csec"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	r, err := New(Config{
+		ClientID:     "cid",
+		ClientSecret: "csec",
+		FilePath:     path,
+		Endpoint:     srv.URL,
+		RefreshLead:  1 * time.Minute,
+		TickInterval: 1 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if err := r.RefreshNow(context.Background()); err != nil {
+		t.Fatalf("RefreshNow: %v", err)
+	}
+	if fake.calls.Load() != 1 {
+		t.Errorf("expected 1 refresh call, got %d", fake.calls.Load())
+	}
+}
+
 func TestSubscribe_NotifiesOnRotation(t *testing.T) {
 	dir := t.TempDir()
 	path := writeInitialCreds(t, dir, time.Now().Add(1*time.Second))

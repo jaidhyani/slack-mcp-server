@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
@@ -34,6 +35,25 @@ func newWithRotatingOAuth(transport, clientID, clientSecret, credFile string, lo
 			zap.Error(err),
 		)
 	}
+	// Synchronously refresh if the on-disk token is within RefreshLead of
+	// expiry, BEFORE starting the background loop or validating. This avoids
+	// racing the goroutine: if the cred file is already expired at startup,
+	// validateAuthAndGetTeamID would otherwise hit Slack with the stale token
+	// and fatal. ErrInvalidGrant is terminal (re-bootstrap required); transient
+	// errors fall through and let validation try the existing in-memory token.
+	if err := rot.RefreshIfDue(context.Background()); err != nil {
+		if errors.Is(err, rotator.ErrInvalidGrant) {
+			logger.Fatal("Refresh token rejected at startup - re-bootstrap required (run slack-mcp-oauth-init)",
+				zap.String("context", "console"),
+				zap.Error(err),
+			)
+		}
+		logger.Warn("Initial token refresh failed (transient); proceeding with existing token",
+			zap.String("context", "console"),
+			zap.Error(err),
+		)
+	}
+
 	rot.Start(context.Background())
 
 	authProvider := rotauth.New(rot)

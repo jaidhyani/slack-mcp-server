@@ -4,19 +4,30 @@
 // browser, exchanges the resulting `code` for an access_token + refresh_token,
 // and writes the credential file in the format pkg/rotator consumes.
 //
-// Usage:
+// Self-host (dev / single-user) usage — listener and browser on the same
+// host, localhost redirect is fine:
 //
 //	slack-mcp-oauth-init \
-//	    --client-id "$SLACK_MCP_OAUTH_CLIENT_ID" \
-//	    --client-secret "$SLACK_MCP_OAUTH_CLIENT_SECRET" \
-//	    --redirect-uri http://localhost:3119/callback \
-//	    --scopes search:read,channels:history,im:history,... \
-//	    --out "$SLACK_MCP_OAUTH_CRED_FILE"
+//	    -client-id "$SLACK_MCP_OAUTH_CLIENT_ID" \
+//	    -client-secret "$SLACK_MCP_OAUTH_CLIENT_SECRET" \
+//	    -redirect-uri http://localhost:3119/callback \
+//	    -out "$SLACK_MCP_OAUTH_CRED_FILE"
 //
-// The redirect URI must exactly match a redirect URL registered on the
-// Slack app. The default port 3119 is registered on the Slack apps the
-// slack-mcp-server team maintains; use a different port only if you've
-// registered it on your app.
+// Distribution usage — Slack requires HTTPS for non-localhost redirects, so
+// front the listener with a TLS-terminating reverse proxy and pass the public
+// HTTPS URL as -redirect-uri. Use -listen to keep the listener on localhost
+// behind the proxy. See docs/05-token-rotation.md for a Caddy snippet.
+//
+//	slack-mcp-oauth-init \
+//	    -client-id "$SLACK_MCP_OAUTH_CLIENT_ID" \
+//	    -client-secret "$SLACK_MCP_OAUTH_CLIENT_SECRET" \
+//	    -redirect-uri https://your-host.example.com/slack-oauth/callback \
+//	    -listen localhost:3119 \
+//	    -out "$SLACK_MCP_OAUTH_CRED_FILE"
+//
+// The redirect URI must exactly match a Redirect URL configured on the Slack
+// app's OAuth & Permissions page. Pass -team T01ABCDE when the browser is
+// signed into multiple workspaces and you want to force a specific one.
 package main
 
 import (
@@ -47,6 +58,7 @@ func main() {
 		userScopes   string
 		outPath      string
 		timeout      time.Duration
+		team         string
 	)
 	flag.StringVar(&clientID, "client-id", "", "Slack app client ID (required)")
 	flag.StringVar(&clientSecret, "client-secret", "", "Slack app client secret (required)")
@@ -56,6 +68,7 @@ func main() {
 	flag.StringVar(&userScopes, "user-scopes", "channels:history,channels:read,groups:history,groups:read,im:history,im:read,im:write,mpim:history,mpim:read,mpim:write,users:read,users:read.email,chat:write,search:read,reactions:write,usergroups:read,usergroups:write", "comma-separated user scopes (passed to user_scope=)")
 	flag.StringVar(&outPath, "out", "", "credential file output path (required)")
 	flag.DurationVar(&timeout, "timeout", 5*time.Minute, "how long to wait for the OAuth callback")
+	flag.StringVar(&team, "team", "", "force a specific workspace by team_id (e.g. T01ABCDE); avoids landing on whatever workspace the browser is currently signed into")
 	flag.Parse()
 
 	if clientID == "" || clientSecret == "" || outPath == "" {
@@ -91,6 +104,9 @@ func main() {
 	}
 	if userScopes != "" {
 		q.Set("user_scope", userScopes)
+	}
+	if team != "" {
+		q.Set("team", team)
 	}
 	authU.RawQuery = q.Encode()
 

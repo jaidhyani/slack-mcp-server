@@ -68,26 +68,124 @@ each other's state.
 - Transient errors (network, 5xx, rate limits) retry with exponential backoff;
   the access token in memory remains valid until its real expiry.
 
-## Bootstrap (`oauth-init` subcommand)
+## Bootstrap (`slack-mcp-oauth-init`)
 
 Single one-time interactive flow:
 
 ```bash
-slack-mcp-server oauth-init \
-  --client-id $SLACK_MCP_OAUTH_CLIENT_ID \
-  --client-secret $SLACK_MCP_OAUTH_CLIENT_SECRET \
-  --redirect-uri http://localhost:3119/callback \
-  --scopes search:read,channels:history,...
+slack-mcp-oauth-init \
+  -client-id $SLACK_MCP_OAUTH_CLIENT_ID \
+  -client-secret $SLACK_MCP_OAUTH_CLIENT_SECRET \
+  -redirect-uri http://localhost:3119/callback \
+  -out $SLACK_MCP_OAUTH_CRED_FILE
 ```
 
 Steps:
-1. Spin up a localhost HTTP listener on the redirect URI.
+1. Spin up a local HTTP listener on the redirect URI.
 2. Print the authorize URL; user opens it in a browser.
 3. Receive the callback with `code`.
 4. Exchange `code` for `access_token` + `refresh_token` via `oauth.v2.access`.
 5. Persist to credential file.
 6. Exit. The user then starts the server normally with the env vars pointing
    at the cred file.
+
+### Redirect URI: dev (localhost) vs. distribution (HTTPS)
+
+Slack's OAuth requirements for the redirect URI differ depending on context:
+
+- **Dev / self-host single-user:** `http://localhost:3119/callback` works
+  fine. The listener and your browser are on the same machine; no reverse
+  proxy is needed.
+- **App Directory submission / multi-user distribution:** Slack requires the
+  redirect URI to be **HTTPS** and **publicly reachable** (no `localhost`,
+  no plain HTTP). Register something like
+  `https://<your-host>/slack-oauth/callback` on the Slack app's OAuth
+  config and front it with a TLS-terminating reverse proxy that forwards to
+  the bootstrap listener on `localhost:3119`.
+
+In both cases the `-redirect-uri` you pass to `slack-mcp-oauth-init` must
+**exactly match** one of the Redirect URLs configured on the Slack app. The
+`-listen` flag lets the listener bind to a different address than the public
+redirect URI advertises — useful when a reverse proxy fronts a public HTTPS
+endpoint:
+
+```bash
+slack-mcp-oauth-init \
+  -client-id $SLACK_MCP_OAUTH_CLIENT_ID \
+  -client-secret $SLACK_MCP_OAUTH_CLIENT_SECRET \
+  -redirect-uri https://your-host.example.com/slack-oauth/callback \
+  -listen localhost:3119 \
+  -out $SLACK_MCP_OAUTH_CRED_FILE
+```
+
+(When `-listen` is omitted, the binary defaults to the redirect URI's
+host:port for localhost redirects, and `localhost:3119` otherwise.)
+
+### Forcing a specific workspace
+
+When the browser is signed into multiple Slack workspaces, Slack's OAuth
+landing page picks one by default — which may not be the one you want to
+install into. Pass `-team T01ABCDE` (the target workspace's `team_id`) to
+force the workspace selector. Without it, you may land on a "redirect_uri
+did not match any configured URIs" error because the chosen workspace
+doesn't host the app.
+
+### Example reverse proxy (Caddy)
+
+Drop this into a Caddy site block on the host whose hostname matches the
+HTTPS redirect URI you registered:
+
+```caddyfile
+your-host.example.com {
+    # Slack OAuth callback proxy — forwards to slack-mcp-oauth-init's
+    # localhost:3119 listener during bootstrap. Slack distribution requires
+    # HTTPS for the redirect URI; this provides it. Use `handle` (not
+    # `handle_path`) so the path /slack-oauth/callback is preserved when
+    # forwarded — the bootstrap binary registers its handler at the full
+    # redirect-uri path.
+    handle /slack-oauth/* {
+        reverse_proxy localhost:3119
+    }
+
+    # ... your other handlers
+}
+```
+
+The proxy only needs to be reachable while the bootstrap is running; it
+plays no role at runtime after the cred file is written. Leaving it
+configured is harmless and lets future re-bootstraps use the same flow.
+
+## Keepalive — when the server is idle for long stretches
+
+Slack rotating refresh tokens have a finite lifetime per refresh: if the
+server is never started during that window, the refresh chain dies and the
+operator must re-bootstrap by hand. The background loop only refreshes
+*while the server is running*, so a server that is only started on-demand
+(e.g. once per Claude Code session) can be too idle to keep the chain
+alive.
+
+Two mitigations:
+
+1. **`slack-mcp-keepalive` cron**: a sibling binary that does one
+   force-refresh per invocation. Run it from cron (nightly is usually
+   plenty — the access TTL is 12h, refresh tokens are valid considerably
+   longer):
+
+   ```bash
+   slack-mcp-keepalive \
+     -client-id $SLACK_MCP_OAUTH_CLIENT_ID \
+     -client-secret $SLACK_MCP_OAUTH_CLIENT_SECRET \
+     -cred-file $SLACK_MCP_OAUTH_CRED_FILE
+   ```
+
+   Exit codes: `0` success, `1` transient failure, `3` terminal failure
+   (re-bootstrap required).
+
+2. **Synchronous startup refresh**: when `slack-mcp-server` starts and the
+   cred file is already past `RefreshLead`, it now refreshes **before** the
+   first auth-validation call. This avoids the goroutine race where the
+   validator hit Slack with the stale token and fatal'd before the
+   background loop had a chance to refresh.
 
 ## Wiring into MCPSlackClient
 
