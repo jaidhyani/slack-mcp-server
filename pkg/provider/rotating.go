@@ -8,6 +8,7 @@ import (
 	"github.com/korotovsky/slack-mcp-server/pkg/limiter"
 	"github.com/korotovsky/slack-mcp-server/pkg/rotator"
 	"github.com/korotovsky/slack-mcp-server/pkg/rotauth"
+	httptransport "github.com/korotovsky/slack-mcp-server/pkg/transport" // the transport parameter shadows the package name
 	"github.com/slack-go/slack"
 	"go.uber.org/zap"
 )
@@ -27,6 +28,7 @@ func newWithRotatingOAuth(transport, clientID, clientSecret, credFile string, lo
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		FilePath:     credFile,
+		HTTPClient:   httptransport.ProvideHTTPClient(nil, logger),
 		Logger:       logger,
 	})
 	if err != nil {
@@ -82,6 +84,21 @@ func newWithRotatingOAuth(transport, clientID, clientSecret, credFile string, lo
 			zap.String("context", "console"),
 			zap.Error(err),
 		)
+	}
+
+	// Other processes share the credential file and rotate it too; before
+	// each API call, adopt what they wrote and rebuild at once, so the call
+	// itself goes out with the current token.
+	client.beforeCall = func() {
+		if !rot.Reload() {
+			return
+		}
+		if err := client.Rebuild(); err != nil {
+			logger.Error("rotator: client rebuild failed after adopting a rotated token",
+				zap.String("context", "console"),
+				zap.Error(err),
+			)
+		}
 	}
 
 	// Subscribe to rotator updates and rebuild the slack/edge clients on

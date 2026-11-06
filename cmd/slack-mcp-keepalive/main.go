@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/korotovsky/slack-mcp-server/pkg/rotator"
+	"github.com/korotovsky/slack-mcp-server/pkg/transport"
 	"go.uber.org/zap"
 )
 
@@ -61,6 +62,7 @@ func main() {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		FilePath:     credFile,
+		HTTPClient:   transport.ProvideHTTPClient(nil, logger),
 		Logger:       logger,
 	})
 	if err != nil {

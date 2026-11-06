@@ -83,9 +83,9 @@ type Config struct {
 	ClientID     string
 	ClientSecret string
 
-	// FilePath is the credential file location. Reads on startup; writes on
-	// every successful refresh. Atomic write-then-rename + flock protects
-	// concurrent rotators from clobbering each other.
+	// FilePath is the credential file location. Reads on startup and before
+	// every refresh; writes on every successful refresh, by write-then-rename.
+	// Refreshes serialize across processes on an flock of FilePath + ".lock".
 	FilePath string
 
 	// Endpoint overrides the Slack OAuth endpoint. Tests use this to point
@@ -110,8 +110,10 @@ type Config struct {
 
 // Rotator owns the credential lifecycle. Construct with New, start the
 // background loop with Start, read the current token via Snapshot, stop with
-// Stop. A given credential file should have exactly one Rotator across all
-// processes — file locking enforces this.
+// Stop. Every process using a credential file runs its own Rotator (each
+// Claude Code session starts its own server), and each refresh retires the
+// token pair before it, so the file is the one current copy: a refresh starts
+// from it under the lock, and Reload picks up what other processes wrote.
 type Rotator struct {
 	cfg Config
 
@@ -121,8 +123,13 @@ type Rotator struct {
 	state atomic.Pointer[Credentials]
 
 	// stateMu serializes refresh operations within a single process.
-	// Cross-process serialization is via flock on the credential file.
+	// Cross-process serialization is via flock on FilePath + ".lock".
 	stateMu sync.Mutex
+
+	// seen is the credential file's stat when Reload last read it, so
+	// Reload can skip the read while the file is unchanged.
+	seenMu sync.Mutex
+	seen   os.FileInfo
 
 	// subscribers is a slice of channels notified after each successful
 	// rotation. Subscribers are managed via Subscribe/Unsubscribe.
@@ -258,7 +265,7 @@ func (r *Rotator) RefreshIfDue(ctx context.Context) error {
 	if !r.shouldRefresh(time.Now()) {
 		return nil
 	}
-	return r.tryRefresh(ctx)
+	return r.tryRefresh(ctx, false)
 }
 
 // RefreshNow forces a synchronous refresh regardless of RefreshLead. Use this
@@ -266,7 +273,37 @@ func (r *Rotator) RefreshIfDue(ctx context.Context) error {
 // when the server may be idle for long stretches between user-driven starts.
 // Returns the same error classes as RefreshIfDue.
 func (r *Rotator) RefreshNow(ctx context.Context) error {
-	return r.tryRefresh(ctx)
+	return r.tryRefresh(ctx, true)
+}
+
+// Reload adopts the credential file's token when another process has rotated
+// it since this one last looked, notifies subscribers, and reports whether it
+// did. It reads the file only when the file's stat has changed, so it is cheap
+// enough to call before every Slack API call; callers that need the new token
+// for the call at hand rebuild their client themselves when it returns true.
+func (r *Rotator) Reload() bool {
+	fi, err := os.Stat(r.cfg.FilePath)
+	if err != nil {
+		return false
+	}
+	r.seenMu.Lock()
+	seen := r.seen
+	r.seenMu.Unlock()
+	if seen != nil && os.SameFile(fi, seen) && fi.ModTime().Equal(seen.ModTime()) && fi.Size() == seen.Size() {
+		return false
+	}
+
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	adopted, err := r.adopt()
+	if err != nil {
+		r.logger.Warn("rotator: reload of the credential file failed", zap.Error(err))
+		return false
+	}
+	r.seenMu.Lock()
+	r.seen = fi
+	r.seenMu.Unlock()
+	return adopted
 }
 
 // Stop terminates the background loop and waits for it to exit. Safe to call
@@ -280,7 +317,7 @@ func (r *Rotator) loop(ctx context.Context) {
 	defer close(r.done)
 
 	if r.shouldRefresh(time.Now()) {
-		if err := r.tryRefresh(ctx); errors.Is(err, ErrInvalidGrant) {
+		if err := r.tryRefresh(ctx, false); errors.Is(err, ErrInvalidGrant) {
 			r.logger.Error("rotator: refresh token rejected on initial check, halting refresh loop",
 				zap.Error(err))
 			return
@@ -302,7 +339,7 @@ func (r *Rotator) loop(ctx context.Context) {
 				backoff = minBackoff
 				continue
 			}
-			err := r.tryRefresh(ctx)
+			err := r.tryRefresh(ctx, false)
 			if err == nil {
 				backoff = minBackoff
 				continue
@@ -336,11 +373,30 @@ func (r *Rotator) shouldRefresh(now time.Time) bool {
 }
 
 // tryRefresh performs one refresh attempt, including disk I/O and notifying
-// subscribers on success. Returns nil on success, ErrInvalidGrant on terminal
-// failure, or another error for transient issues.
-func (r *Rotator) tryRefresh(ctx context.Context) error {
+// subscribers on success. It holds the cross-process lock from reading the
+// refresh token to writing its successor, and starts from the file: when
+// another process rotated first, this one adopts that token rather than
+// spending a refresh token Slack has already retired, and refreshes only if
+// the adopted token is itself due (a forced refresh counts the other
+// process's rotation as its own). Returns nil on success, ErrInvalidGrant on
+// terminal failure, or another error for transient issues.
+func (r *Rotator) tryRefresh(ctx context.Context, force bool) error {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
+
+	unlock, err := lockExclusive(r.cfg.FilePath + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	adopted, err := r.adopt()
+	if err != nil {
+		return fmt.Errorf("re-read credentials: %w", err)
+	}
+	if adopted && (force || !r.shouldRefresh(time.Now())) {
+		return nil
+	}
 
 	cur := r.state.Load()
 	resp, err := r.callOAuth(ctx, cur.RefreshToken)
@@ -373,6 +429,27 @@ func (r *Rotator) tryRefresh(ctx context.Context) error {
 		zap.String("team_id", next.TeamID))
 	r.notify()
 	return nil
+}
+
+// adopt loads the credential file and, when its access token differs from
+// the one in memory, makes the file's credentials current and notifies
+// subscribers. Only a refresh or a bootstrap writes the file, so a different
+// token on disk is a newer one. Reports whether it adopted. The caller holds
+// stateMu.
+func (r *Rotator) adopt() (bool, error) {
+	disk, err := loadCreds(r.cfg.FilePath)
+	if err != nil {
+		return false, err
+	}
+	if disk.AccessToken == r.state.Load().AccessToken {
+		return false, nil
+	}
+	r.state.Store(disk)
+	r.logger.Info("rotator: adopted a token another process rotated",
+		zap.Time("expires_at", disk.ExpiresAt),
+		zap.String("team_id", disk.TeamID))
+	r.notify()
+	return true, nil
 }
 
 // oauthResponse is the subset of oauth.v2.access fields we use.
@@ -439,19 +516,14 @@ func (r *Rotator) callOAuth(ctx context.Context, refreshToken string) (*oauthRes
 }
 
 // loadCreds reads and parses the credential file at path. Returns an error
-// if missing or malformed.
+// if missing or malformed. writeCreds replaces the file by rename, so a read
+// sees the old file or the new one whole, and needs no lock.
 func loadCreds(path string) (*Credentials, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-
-	// Shared lock during read; serialized with concurrent writers.
-	if err := flock(f, syscall.LOCK_SH); err != nil {
-		return nil, fmt.Errorf("flock(LOCK_SH): %w", err)
-	}
-	defer flock(f, syscall.LOCK_UN)
 
 	var c Credentials
 	if err := json.NewDecoder(f).Decode(&c); err != nil {
@@ -469,28 +541,14 @@ func loadCreds(path string) (*Credentials, error) {
 	return &c, nil
 }
 
-// writeCreds atomically replaces the credential file at path with c. Uses a
-// temp file in the same directory + rename, with an exclusive flock during
-// the swap so concurrent writers serialize.
+// writeCreds atomically replaces the credential file at path with c, by a
+// temp file in the same directory + rename. tryRefresh holds the refresh
+// lock around it, so writers don't race.
 func writeCreds(path string, c *Credentials) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-
-	// Open the destination file (creating if missing) just to take the
-	// exclusive lock. We don't write into it directly — that's the temp
-	// file's job — but holding the lock here makes concurrent rotators
-	// serialize their swaps.
-	lockf, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return fmt.Errorf("open lock target %s: %w", path, err)
-	}
-	defer lockf.Close()
-	if err := flock(lockf, syscall.LOCK_EX); err != nil {
-		return fmt.Errorf("flock(LOCK_EX): %w", err)
-	}
-	defer flock(lockf, syscall.LOCK_UN)
 
 	tmp, err := os.CreateTemp(dir, ".cred-*.tmp")
 	if err != nil {
@@ -526,6 +584,25 @@ func writeCreds(path string, c *Credentials) error {
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
 	}
 	return nil
+}
+
+// lockExclusive takes an exclusive flock on path, creating it if needed, and
+// returns the unlock. The refresh lock lives on its own file because
+// writeCreds replaces the credential file by rename, and a lock held on a
+// replaced inode excludes nobody.
+func lockExclusive(path string) (func(), error) {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file %s: %w", path, err)
+	}
+	if err := flock(f, syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("flock(LOCK_EX) %s: %w", path, err)
+	}
+	return func() {
+		_ = flock(f, syscall.LOCK_UN)
+		f.Close()
+	}, nil
 }
 
 // flock wraps syscall.Flock for unix systems; on platforms without flock

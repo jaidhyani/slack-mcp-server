@@ -244,6 +244,11 @@ type MCPSlackClient struct {
 	isBotToken   atomic.Bool
 	edgeFailed   bool // set when edge API fails; subsequent calls skip straight to standard API
 	teamEndpoint string
+
+	// beforeCall, when set, runs before every Slack API call. The rotating
+	// OAuth provider uses it to adopt a token another process rotated, so a
+	// long-lived server never calls Slack with a token rotation has revoked.
+	beforeCall func()
 }
 
 // classifyToken returns (isOAuth, isBotToken) for a Slack token. Recognizes
@@ -255,11 +260,21 @@ func classifyToken(token string) (oauth, bot bool) {
 	return
 }
 
-// sc returns the current slack.Client pointer. Lock-free.
-func (c *MCPSlackClient) sc() *slack.Client { return c.slackClient.Load() }
+// sc returns the current slack.Client pointer, after beforeCall.
+func (c *MCPSlackClient) sc() *slack.Client {
+	if c.beforeCall != nil {
+		c.beforeCall()
+	}
+	return c.slackClient.Load()
+}
 
-// ec returns the current edge.Client pointer. Lock-free.
-func (c *MCPSlackClient) ec() *edge.Client { return c.edgeClient.Load() }
+// ec returns the current edge.Client pointer, after beforeCall.
+func (c *MCPSlackClient) ec() *edge.Client {
+	if c.beforeCall != nil {
+		c.beforeCall()
+	}
+	return c.edgeClient.Load()
+}
 
 // Rebuild reconstructs the underlying slack and edge clients using the
 // current token from authProvider, and recomputes the token-type flags so
